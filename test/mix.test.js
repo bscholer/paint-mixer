@@ -42,7 +42,9 @@ test('solver recovers a known recipe', () => {
     { hex: paint('Snow White').hex, count: 3 },
     { hex: paint('True Red').hex, count: 1 },
   ]);
-  const [best] = solve(target, DEFAULT_PAINTS, { maxDrops: 12 });
+  // Light Buttermilk is close enough to white to tie after hex rounding, so leave it out.
+  const paints = DEFAULT_PAINTS.filter((p) => p.name !== 'Light Buttermilk');
+  const [best] = solve(target, paints, { maxDrops: 12 });
   assert.equal(best.label, 'Closest match');
   assert.ok(best.deltaE < 0.5, `deltaE ${best.deltaE}`);
   const counts = Object.fromEntries(best.drops.map((d) => [d.paint.name, d.count]));
