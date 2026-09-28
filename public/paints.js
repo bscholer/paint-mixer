@@ -17,4 +17,4 @@ export const DEFAULT_PAINTS = [
   { id: 'festive-green', name: 'Festive Green', hex: '#009a44' }, // DA230
   { id: 'forest-green', name: 'Forest Green', hex: '#206137' }, // DAO50
   { id: 'dark-chocolate', name: 'Dark Chocolate', hex: '#301e0a' }, // DAO65
-].map((p) => ({ ...p, enabled: true }));
+].map((p) => ({ ...p, enabled: true, strength: 1 }));

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deltaE2000, hexToLab, mixDrops, parseHex, solve } from '../public/mix.js';
+import { calibrate, deltaE2000, hexToLab, hexToRgb, mixDrops, parseHex, rgbToHex, solve, WHITE_REFERENCE } from '../public/mix.js';
 import { DEFAULT_PAINTS } from '../public/paints.js';
 
 const paint = (name) => DEFAULT_PAINTS.find((p) => p.name === name);
@@ -91,4 +91,52 @@ test('parseHex normalizes shorthand and rejects junk', () => {
   assert.equal(parseHex(' #6B8E23 '), '#6b8e23');
   assert.equal(parseHex('#12345'), null);
   assert.equal(parseHex('#ggg'), null);
+});
+
+test('strength makes a weak paint barely move a strong one', () => {
+  const base = [{ hex: paint('Turquoise').hex, count: 5 }];
+  const red = { hex: paint('True Red').hex, count: 1 };
+  const shift = (strength) =>
+    deltaE2000(hexToLab(paint('Turquoise').hex), hexToLab(mixDrops([...base, { ...red, strength }])));
+  assert.ok(shift(0.05) < shift(1) / 3, `weak red shifted ${shift(0.05)}, full red ${shift(1)}`);
+});
+
+test('calibration undoes a warm light cast and recovers each paint', () => {
+  const white = WHITE_REFERENCE;
+  const truth = [
+    { id: 'black', hex: '#1c1c1e', strength: 6 },
+    { id: 'turquoise', hex: '#8fd6d0', strength: 0.4 },
+    { id: 'red', hex: '#b3222a', strength: 1.5 },
+  ];
+  // A warm lamp: strong red, weak blue, in linear light.
+  const lamp = [1, 0.82, 0.55];
+  const lit = (hex) => {
+    const rgb = hexToRgb(hex).map((v) => {
+      const c = v / 255;
+      return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return rgbToHex(rgb.map((c, i) => {
+      const x = Math.min(1, c * lamp[i]);
+      return (x <= 0.0031308 ? 12.92 * x : 1.055 * x ** (1 / 2.4) - 0.055) * 255;
+    }));
+  };
+  const samples = truth.map((p) => ({
+    id: p.id,
+    mass: lit(p.hex),
+    tint: lit(mixDrops([{ hex: p.hex, count: 1, strength: p.strength }, { hex: white, count: 5 }])),
+  }));
+  const result = calibrate({ white: lit(white), samples, whiteDrops: 5 });
+  for (const p of truth) {
+    const got = result.find((r) => r.id === p.id);
+    const de = deltaE2000(hexToLab(got.hex), hexToLab(p.hex));
+    assert.ok(de < 1.5, `${p.id}: ${got.hex} vs ${p.hex}, deltaE ${de}`);
+    assert.ok(Math.abs(Math.log(got.strength / p.strength)) < Math.log(1.25), `${p.id}: strength ${got.strength} vs ${p.strength}`);
+  }
+});
+
+test('calibration fits strength from the old color when the pure patch is skipped', () => {
+  const tint = mixDrops([{ hex: '#b3222a', count: 1, strength: 2 }, { hex: WHITE_REFERENCE, count: 5 }]);
+  const [r] = calibrate({ white: WHITE_REFERENCE, samples: [{ id: 'red', tint, fallbackHex: '#b3222a' }], whiteDrops: 5 });
+  assert.equal(r.hex, undefined);
+  assert.ok(Math.abs(r.strength - 2) < 0.2, `strength ${r.strength}`);
 });

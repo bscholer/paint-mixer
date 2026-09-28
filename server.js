@@ -50,21 +50,28 @@ export function openDb(dataDir) {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
       );
     `);
-    writePaints(db, DEFAULT_PAINTS);
     db.exec('PRAGMA user_version = 1; COMMIT;');
+  }
+  if (version < 2) {
+    db.exec(`
+      BEGIN;
+      ALTER TABLE paints ADD COLUMN strength REAL NOT NULL DEFAULT 1;
+    `);
+    if (version < 1) writePaints(db, DEFAULT_PAINTS);
+    db.exec('PRAGMA user_version = 2; COMMIT;');
   }
   return db;
 }
 
 function writePaints(db, paints) {
   db.exec('DELETE FROM paints');
-  const insert = db.prepare('INSERT INTO paints (id, name, hex, enabled, position) VALUES (?, ?, ?, ?, ?)');
-  paints.forEach((p, i) => insert.run(p.id, p.name, p.hex, p.enabled ? 1 : 0, i));
+  const insert = db.prepare('INSERT INTO paints (id, name, hex, enabled, strength, position) VALUES (?, ?, ?, ?, ?, ?)');
+  paints.forEach((p, i) => insert.run(p.id, p.name, p.hex, p.enabled ? 1 : 0, p.strength ?? 1, i));
 }
 
 function readPaints(db) {
   return db
-    .prepare('SELECT id, name, hex, enabled FROM paints ORDER BY position')
+    .prepare('SELECT id, name, hex, enabled, strength FROM paints ORDER BY position')
     .all()
     .map((p) => ({ ...p, enabled: !!p.enabled }));
 }
@@ -91,10 +98,13 @@ function validatePaints(body) {
     if (!p || !str(p.id, 64) || !str(p.name, 60) || !hex(p.hex) || typeof p.enabled !== 'boolean') {
       throw new HttpError(400, 'each paint needs id, name, lowercase #rrggbb hex, and enabled');
     }
+    if (p.strength !== undefined && !(Number.isFinite(p.strength) && p.strength >= 0.01 && p.strength <= 100)) {
+      throw new HttpError(400, 'strength must be a number from 0.01 to 100');
+    }
     if (ids.has(p.id)) throw new HttpError(400, `duplicate paint id ${p.id}`);
     ids.add(p.id);
   }
-  return body.map(({ id, name, hex, enabled }) => ({ id, name: name.trim(), hex, enabled }));
+  return body.map(({ id, name, hex, enabled, strength = 1 }) => ({ id, name: name.trim(), hex, enabled, strength }));
 }
 
 function validateRecipe(b) {

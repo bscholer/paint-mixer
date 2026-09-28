@@ -1,4 +1,4 @@
-import { parseHex, hexToRgb, rgbToHex, describeDeltaE } from './mix.js';
+import { parseHex, hexToRgb, hexToLab, rgbToHex, describeDeltaE, calibrate, WHITE_REFERENCE } from './mix.js';
 import { DEFAULT_PAINTS } from './paints.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -140,6 +140,7 @@ $('#photoInput').addEventListener('change', async (e) => {
     $('#photoCard').hidden = false;
     lastPick = null;
     resetView();
+    renderCalib();
     $('#photoCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch {
     toast('Could not open that image.');
@@ -151,6 +152,7 @@ $('#photoInput').addEventListener('change', async (e) => {
 $('#clearPhoto').addEventListener('click', () => {
   $('#photoCard').hidden = true;
   pixels = null;
+  endCalib();
 });
 
 const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
@@ -244,7 +246,9 @@ function pick(e, commit) {
   loupe.textContent = hex;
   loupe.style.color = textOn(hex);
 
-  if (commit) setTarget(hex);
+  if (calib) {
+    if (commit) recordCalibSample(hex);
+  } else if (commit) setTarget(hex);
   else previewTarget(hex);
 }
 
@@ -262,7 +266,7 @@ let pinch = null;
 function cancelPick() {
   picking = false;
   $('#loupe').hidden = true;
-  if (state.target) previewTarget(state.target);
+  if (state.target && !calib) previewTarget(state.target);
 }
 
 function pinchState() {
@@ -542,18 +546,37 @@ function renderPaints() {
     root.append(
       h('li', { class: 'paint-row' },
         swatch,
-        h('input', {
-          class: 'paint-name',
-          type: 'text',
-          value: p.name,
-          maxlength: '60',
-          'aria-label': 'Paint name',
-          oninput: (e) => {
-            if (!e.target.value.trim()) return;
-            p.name = e.target.value.trim();
-            paintsChanged();
-          },
-        }),
+        h('div', { class: 'paint-main' },
+          h('input', {
+            class: 'paint-name',
+            type: 'text',
+            value: p.name,
+            maxlength: '60',
+            'aria-label': 'Paint name',
+            oninput: (e) => {
+              if (!e.target.value.trim()) return;
+              p.name = e.target.value.trim();
+              paintsChanged();
+            },
+          }),
+          h('label', { class: 'strength' },
+            'Strength',
+            h('input', {
+              type: 'number',
+              inputmode: 'decimal',
+              min: '0.01',
+              max: '100',
+              step: '0.1',
+              value: String(round2(p.strength ?? 1)),
+              oninput: (e) => {
+                const v = Number(e.target.value);
+                if (!(v >= 0.01 && v <= 100)) return;
+                p.strength = v;
+                paintsChanged();
+              },
+            }),
+          ),
+        ),
         h('button', {
           class: 'icon-btn',
           type: 'button',
@@ -595,7 +618,7 @@ function renderPaints() {
 }
 
 $('#addPaint').addEventListener('click', () => {
-  state.paints.push({ id: crypto.randomUUID(), name: 'New paint', hex: state.target || '#808080', enabled: true });
+  state.paints.push({ id: crypto.randomUUID(), name: 'New paint', hex: state.target || '#808080', enabled: true, strength: 1 });
   renderPaints();
   paintsChanged();
   const names = document.querySelectorAll('.paint-name');
@@ -607,6 +630,159 @@ $('#resetPaints').addEventListener('click', () => {
   state.paints = clone(DEFAULT_PAINTS);
   renderPaints();
   paintsChanged();
+});
+
+// ---------- calibration ----------
+
+// One photo holds a white patch plus, for each paint, a pure patch and a 1:N tint with white.
+// The user taps them in order. calibrate() then white-balances and fits hex and strength.
+let calib = null;
+const round2 = (v) => Math.round(v * 100) / 100;
+
+// Default white: the last one used, else the lightest near-neutral paint.
+function defaultWhite() {
+  const last = state.paints.find((p) => p.id === store.get('calibWhite', null));
+  if (last) return last;
+  const score = (p) => {
+    const [L, a, b] = hexToLab(p.hex);
+    return Math.hypot(a, b) < 10 ? L : L - 100;
+  };
+  return state.paints.reduce((a, b) => (score(b) > score(a) ? b : a));
+}
+
+const whitePaint = () => state.paints.find((p) => p.id === $('#calibWhite').value);
+
+function openCalibDialog() {
+  if (!state.paints.length) return toast('Add some paints first.');
+  const dialog = $('#calibDialog');
+  const select = $('#calibWhite');
+  select.replaceChildren(...state.paints.map((p) => h('option', { value: p.id }, p.name)));
+  select.value = defaultWhite().id;
+  const sync = () => {
+    dialog.querySelectorAll('.white-name').forEach((el) => (el.textContent = whitePaint().name));
+    dialog.querySelectorAll('.white-drops').forEach((el) => (el.textContent = $('#calibWhiteDrops').value));
+  };
+  select.onchange = sync;
+  $('#calibWhiteDrops').oninput = sync;
+  sync();
+  dialog.showModal();
+}
+
+$('#startCalib').addEventListener('click', openCalibDialog);
+
+// Opens the file picker inside the click, so mobile browsers treat it as a user action.
+$('#calibDialog button[value=start]').addEventListener('click', (e) => {
+  const whiteDrops = Math.round(Number($('#calibWhiteDrops').value));
+  if (!(whiteDrops >= 1 && whiteDrops <= 50)) {
+    e.preventDefault();
+    return toast('Use 1 to 50 drops of white.');
+  }
+  const white = whitePaint();
+  store.set('calibWhite', white.id);
+  const others = state.paints.filter((p) => p.enabled && p !== white);
+  calib = {
+    white,
+    whiteDrops,
+    i: 0,
+    samples: new Map(),
+    steps: [
+      { key: 'white', label: `${white.name} patch` },
+      ...others.flatMap((p) => [
+        { key: `${p.id}:mass`, label: `${p.name}, pure` },
+        { key: `${p.id}:tint`, label: `${p.name} + ${whiteDrops} ${white.name}` },
+      ]),
+    ],
+  };
+  showTab('mix');
+  $('#photoInput').click();
+});
+
+function renderCalib() {
+  $('#calibBar').hidden = !calib;
+  $('#photoHint').textContent = calib ? 'Tap the patch. Pinch to zoom.' : 'Drag to pick. Pinch to zoom.';
+  if (!calib) return;
+  const step = calib.steps[calib.i];
+  $('#calibCount').textContent = `Step ${calib.i + 1} of ${calib.steps.length}: tap`;
+  $('#calibLabel').textContent = step.label;
+  $('#calibBack').disabled = calib.i === 0;
+}
+
+function endCalib() {
+  calib = null;
+  renderCalib();
+}
+
+function advanceCalib() {
+  calib.i++;
+  if (calib.i < calib.steps.length) renderCalib();
+  else finishCalib();
+}
+
+function recordCalibSample(hex) {
+  calib.samples.set(calib.steps[calib.i].key, hex);
+  advanceCalib();
+}
+
+$('#calibSkip').addEventListener('click', () => {
+  if (calib.i === 0) return toast('The white patch is needed to correct the light.');
+  calib.samples.delete(calib.steps[calib.i].key);
+  advanceCalib();
+});
+$('#calibBack').addEventListener('click', () => {
+  calib.i = Math.max(0, calib.i - 1);
+  renderCalib();
+});
+$('#calibCancel').addEventListener('click', endCalib);
+
+function finishCalib() {
+  const { white, whiteDrops, samples } = calib;
+  const others = state.paints.filter((p) => p.enabled && p !== white);
+  const results = calibrate({
+    white: samples.get('white'),
+    whiteDrops,
+    samples: others.map((p) => ({
+      id: p.id,
+      mass: samples.get(`${p.id}:mass`),
+      tint: samples.get(`${p.id}:tint`),
+      fallbackHex: p.hex,
+    })),
+  });
+  const changes = [{ paint: white, hex: WHITE_REFERENCE, strength: 1 }];
+  for (const r of results) {
+    if (r.hex || r.strength) changes.push({ paint: state.paints.find((p) => p.id === r.id), hex: r.hex, strength: r.strength });
+  }
+  calib.i = calib.steps.length - 1;
+  calib.changes = changes;
+
+  const swatch = (hex) => h('i', { class: 'dot', style: { background: hex } });
+  $('#calibResults').replaceChildren(
+    ...changes.map(({ paint, hex, strength }) =>
+      h('li', {},
+        h('span', { class: 'name' }, paint.name),
+        h('span', { class: 'review-hex' }, swatch(paint.hex), '→', swatch(hex || paint.hex)),
+        h('span', { class: 'muted review-strength' },
+          `×${round2(paint.strength ?? 1)} → ×${round2(strength ?? paint.strength ?? 1)}`),
+      ),
+    ),
+  );
+  $('#calibReview').showModal();
+}
+
+$('#calibReview').addEventListener('close', () => {
+  if (!calib) return;
+  if ($('#calibReview').returnValue === 'apply') {
+    for (const { paint, hex, strength } of calib.changes) {
+      if (hex) paint.hex = hex;
+      if (strength) paint.strength = round2(Math.min(100, Math.max(0.01, strength)));
+    }
+    renderPaints();
+    paintsChanged();
+    toast(`Calibrated ${calib.changes.length} paints.`);
+    endCalib();
+    showTab('paints');
+  } else {
+    renderCalib();
+  }
 });
 
 // ---------- startup ----------

@@ -10,12 +10,22 @@ A small PWA that tells you how many drops of each paint you own to mix a target 
 ## How the mix is predicted
 
 Each paint's color becomes a Kubelka-Munk absorption/scattering ratio for each linear-RGB channel.
-Ratios mix linearly by drop count. The solver tries every one-, two-, and three-paint recipe up to
-the drop limit and ranks them by CIEDE2000 difference from the target.
-Recipes are always in lowest terms (2:1, not 4:2). Use the ×2/×3/×5 buttons for a larger batch.
+Ratios mix linearly by weight. A drop's weight is its count times the paint's strength.
+The solver tries every one-, two-, and three-paint recipe up to the drop limit and ranks them by
+CIEDE2000 difference from the target. Recipes are always in lowest terms (2:1, not 4:2).
+Use the ×2/×3/×5 buttons for a larger batch.
 
-The default hex values are estimates. For better predictions, paint a swatch of each paint, let it
-dry, photograph it in daylight, and use the eyedropper button on the Paints tab.
+Strength matters a lot. A drop of lamp black changes a mix much more than a drop of a pastel
+that has a lot of white in it. Chart colors do not tell you this, so calibrate your paints:
+
+1. Paint a patch of your white.
+2. For each paint, paint a patch of the pure paint.
+3. Next to it, paint a patch of 1 drop of that paint mixed with 5 drops of white.
+4. Let the patches dry, and take one photo in daylight.
+5. On the Paints tab, tap **Calibrate from photo** and tap each patch when the app asks.
+
+The app uses the white patch to remove the color cast of the light. Then it measures the color of
+each paint and fits its strength from the mixed patch.
 
 ## Run
 

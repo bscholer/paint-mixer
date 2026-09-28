@@ -1,9 +1,12 @@
 // Paint mixing model and drop-count solver. Shared by the browser (worker) and the Node tests.
 //
 // Mixing uses single-constant Kubelka-Munk per linear-RGB channel: each paint's reflectance
-// becomes an absorption/scattering ratio (K/S), ratios mix linearly by drop count, and the
-// result converts back to reflectance. This makes blue + yellow go green and lets a little
-// black overpower a lot of white, which additive RGB averaging gets wrong.
+// becomes an absorption/scattering ratio (K/S), ratios mix linearly by weight, and the result
+// converts back to reflectance. This makes blue + yellow go green, which RGB averaging gets wrong.
+//
+// A drop's weight is its count times the paint's tinting strength. Paints differ a lot here:
+// a drop of lamp black shifts a mix far more than a drop of a white-heavy pastel. Strength is
+// relative to the white paint (strength 1) and comes from calibrate().
 
 const HEX_RE = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i;
 
@@ -116,13 +119,15 @@ export function deltaE2000([L1, a1, b1], [L2, a2, b2]) {
   return Math.sqrt(l * l + c * c + h * h + RT * c * h);
 }
 
-// drops: [{ hex, count }]
+const strengthOf = (p) => p.strength ?? 1;
+
+// drops: [{ hex, count, strength? }]
 export function mixDrops(drops) {
-  const total = drops.reduce((s, d) => s + d.count, 0);
+  const total = drops.reduce((s, d) => s + d.count * strengthOf(d), 0);
   if (!total) throw new Error('no drops to mix');
   const ks = [0, 0, 0];
   for (const d of drops) {
-    hexToLinear(d.hex).forEach((c, i) => (ks[i] += d.count * toKS(c)));
+    hexToLinear(d.hex).forEach((c, i) => (ks[i] += d.count * strengthOf(d) * toKS(c)));
   }
   return linearToHex(ks.map((k) => fromKS(k / total)));
 }
@@ -137,6 +142,7 @@ const gcd = (a, b) => (b ? gcd(b, a % b) : a);
 export function solve(targetHex, paints, { maxDrops = 30, maxPaints = 3 } = {}) {
   const target = hexToLab(targetHex);
   const ks = paints.map((p) => hexToLinear(p.hex).map(toKS));
+  const strength = paints.map(strengthOf);
   const n = paints.length;
   const k = Math.min(maxPaints, n);
 
@@ -151,11 +157,15 @@ export function solve(targetHex, paints, { maxDrops = 30, maxPaints = 3 } = {}) 
 
   function evaluate(size) {
     let total = 0;
-    for (let i = 0; i < size; i++) total += cnt[i];
+    let weight = 0;
+    for (let i = 0; i < size; i++) {
+      total += cnt[i];
+      weight += cnt[i] * strength[idx[i]];
+    }
     for (let c = 0; c < 3; c++) {
       let s = 0;
-      for (let i = 0; i < size; i++) s += cnt[i] * ks[idx[i]][c];
-      lin[c] = fromKS(s / total);
+      for (let i = 0; i < size; i++) s += cnt[i] * strength[idx[i]] * ks[idx[i]][c];
+      lin[c] = fromKS(s / weight);
     }
     const de = deltaE2000(target, linearToLab(lin));
     const snap = () => ({ idx: idx.slice(0, size), cnt: cnt.slice(0, size), total, de });
@@ -214,8 +224,51 @@ export function solve(targetHex, paints, { maxDrops = 30, maxPaints = 3 } = {}) 
       drops,
       total: r.total,
       deltaE: r.de,
-      hex: mixDrops(drops.map((d) => ({ hex: d.paint.hex, count: d.count }))),
+      hex: mixDrops(drops.map((d) => ({ hex: d.paint.hex, count: d.count, strength: strengthOf(d.paint) }))),
     };
+  });
+}
+
+// The white paint's dried color. A calibration photo is white-balanced so its white patch
+// matches this, which removes the color cast of the light.
+export const WHITE_REFERENCE = '#f4f4f1';
+
+// Best strength for a paint, from its pure color and the color of 1 drop mixed with
+// `whiteDrops` drops of white. Searches log-spaced strengths, then refines around the best.
+export function fitStrength(massHex, tintHex, whiteHex, whiteDrops) {
+  const tint = hexToLab(tintHex);
+  const err = (s) =>
+    deltaE2000(tint, hexToLab(mixDrops([{ hex: massHex, count: 1, strength: s }, { hex: whiteHex, count: whiteDrops }])));
+  let lo = Math.log(0.01), hi = Math.log(100);
+  for (let round = 0; round < 4; round++) {
+    const steps = 40;
+    let bestX = lo, bestE = Infinity;
+    for (let i = 0; i <= steps; i++) {
+      const x = lo + ((hi - lo) * i) / steps;
+      const e = err(Math.exp(x));
+      if (e < bestE) [bestX, bestE] = [x, e];
+    }
+    const span = (hi - lo) / steps;
+    [lo, hi] = [bestX - span, bestX + span];
+  }
+  return Math.exp((lo + hi) / 2);
+}
+
+// Turns raw photo samples into calibrated paints.
+//   white: hex of the white patch in the photo
+//   samples: [{ id, mass?, tint?, fallbackHex? }] with photo hexes of each paint's pure patch and
+//   its 1:whiteDrops tint. fallbackHex stands in for an unsampled pure patch when fitting strength.
+// Returns [{ id, hex?, strength? }], leaving out anything that was not sampled.
+export function calibrate({ white, samples, whiteDrops }) {
+  const ref = hexToLinear(WHITE_REFERENCE);
+  const gain = hexToLinear(white).map((c, i) => ref[i] / Math.max(c, 1e-4));
+  const balance = (hex) => linearToHex(hexToLinear(hex).map((c, i) => Math.min(1, c * gain[i])));
+  return samples.map(({ id, mass, tint, fallbackHex }) => {
+    const out = { id };
+    if (mass) out.hex = balance(mass);
+    const massHex = out.hex || fallbackHex;
+    if (tint && massHex) out.strength = fitStrength(massHex, balance(tint), WHITE_REFERENCE, whiteDrops);
+    return out;
   });
 }
 
