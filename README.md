@@ -3,7 +3,7 @@
 A small PWA that tells you how many drops of each paint you own to mix a target color.
 
 - Pick the target from a photo (tap or drag), a hex code, or the system color picker.
-- Keep a list of your paints. It starts with 12 Apple Barrel colors. Edit, add, turn off, or calibrate each one.
+- Keep a list of your paints. It starts with 16 DecoArt Americana colors. Edit, add, turn off, or calibrate each one.
 - Get up to three recipes: the closest match, the one with the fewest drops, and one that uses different paints.
 - Save recipes. Paints and recipes live in SQLite on the server, so every device sees the same list.
 

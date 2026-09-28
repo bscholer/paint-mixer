@@ -138,7 +138,8 @@ $('#photoInput').addEventListener('change', async (e) => {
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
     pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
     $('#photoCard').hidden = false;
-    $('#marker').hidden = true;
+    lastPick = null;
+    resetView();
     $('#photoCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch {
     toast('Could not open that image.');
@@ -169,25 +170,76 @@ function sampleAt(x, y, radius) {
   return rgbToHex(sum.map((s) => srgb(s / n) * 255));
 }
 
+// Photo view: one finger picks, two fingers pinch-zoom and pan, the mouse wheel zooms.
+const stage = $('.photo-stage');
+const view = { s: 1, tx: 0, ty: 0 };
+const MAX_ZOOM = 10;
+let lastPick = null;
+
+// Untransformed canvas box in client coordinates. The CSS transform is applied on top of it.
+function canvasBase() {
+  const r = stage.getBoundingClientRect();
+  return { left: r.left + canvas.offsetLeft, top: r.top + canvas.offsetTop, w: canvas.offsetWidth, h: canvas.offsetHeight };
+}
+
+function applyView() {
+  const { w, h } = canvasBase();
+  view.s = Math.min(MAX_ZOOM, Math.max(1, view.s));
+  // Keep the zoomed photo covering its box so it cannot be dragged away.
+  view.tx = Math.min(0, Math.max(w - w * view.s, view.tx));
+  view.ty = Math.min(0, Math.max(h - h * view.s, view.ty));
+  canvas.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`;
+  $('#fitPhoto').hidden = view.s === 1;
+  placeMarker();
+}
+
+function resetView() {
+  Object.assign(view, { s: 1, tx: 0, ty: 0 });
+  applyView();
+}
+
+// Zooms to scale s while the photo point under the client point (cx, cy) stays put.
+function zoomAt(cx, cy, s, anchor = null) {
+  const base = canvasBase();
+  const a = anchor || { x: (cx - base.left - view.tx) / view.s, y: (cy - base.top - view.ty) / view.s };
+  view.s = Math.min(MAX_ZOOM, Math.max(1, s));
+  view.tx = cx - base.left - a.x * view.s;
+  view.ty = cy - base.top - a.y * view.s;
+  applyView();
+}
+
+// Stage-relative position of a canvas pixel under the current view.
+function toStage(x, y) {
+  const k = (canvas.offsetWidth / canvas.width) * view.s;
+  return { x: canvas.offsetLeft + view.tx + x * k, y: canvas.offsetTop + view.ty + y * k };
+}
+
+function placeMarker() {
+  const marker = $('#marker');
+  marker.hidden = !lastPick;
+  if (!lastPick) return;
+  const p = toStage(lastPick.x + 0.5, lastPick.y + 0.5);
+  marker.style.left = `${p.x}px`;
+  marker.style.top = `${p.y}px`;
+}
+
 function pick(e, commit) {
   if (!pixels) return;
   const rect = canvas.getBoundingClientRect();
-  const px = Math.min(rect.width - 1, Math.max(0, e.clientX - rect.left));
-  const py = Math.min(rect.height - 1, Math.max(0, e.clientY - rect.top));
   const scale = canvas.width / rect.width;
-  const x = Math.floor(px * scale);
-  const y = Math.floor(py * scale);
-  const hex = sampleAt(x, y, Math.max(1, Math.round(4 * scale)));
+  const x = Math.min(canvas.width - 1, Math.max(0, Math.floor((e.clientX - rect.left) * scale)));
+  const y = Math.min(canvas.height - 1, Math.max(0, Math.floor((e.clientY - rect.top) * scale)));
+  // About a 9px screen square, so zooming in also makes the sample smaller.
+  const hex = sampleAt(x, y, Math.max(0, Math.round(4 * scale)));
+  lastPick = { x, y };
+  placeMarker();
 
-  const offX = canvas.offsetLeft, offY = canvas.offsetTop;
-  const marker = $('#marker');
-  marker.hidden = false;
-  marker.style.left = `${offX + px}px`;
-  marker.style.top = `${offY + py}px`;
   const loupe = $('#loupe');
+  const p = toStage(x + 0.5, y + 0.5);
   loupe.hidden = commit;
-  loupe.style.left = `${offX + px}px`;
-  loupe.style.top = `${offY + py}px`;
+  loupe.classList.toggle('below', p.y < 150);
+  loupe.style.left = `${p.x}px`;
+  loupe.style.top = `${p.y}px`;
   loupe.style.background = hex;
   loupe.textContent = hex;
   loupe.style.color = textOn(hex);
@@ -203,23 +255,68 @@ function previewTarget(hex) {
   $('#targetLabel').textContent = hex;
 }
 
+const pointers = new Map();
 let picking = false;
-canvas.addEventListener('pointerdown', (e) => {
-  picking = true;
-  canvas.setPointerCapture(e.pointerId);
-  pick(e, false);
-});
-canvas.addEventListener('pointermove', (e) => picking && pick(e, false));
-canvas.addEventListener('pointerup', (e) => {
-  if (!picking) return;
-  picking = false;
-  pick(e, true);
-});
-canvas.addEventListener('pointercancel', () => {
+let pinch = null;
+
+function cancelPick() {
   picking = false;
   $('#loupe').hidden = true;
   if (state.target) previewTarget(state.target);
+}
+
+function pinchState() {
+  const [a, b] = [...pointers.values()];
+  return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1 };
+}
+
+stage.addEventListener('pointerdown', (e) => {
+  stage.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1 && !pinch) {
+    picking = true;
+    pick(e, false);
+  } else if (pointers.size === 2) {
+    cancelPick();
+    const g = pinchState();
+    const base = canvasBase();
+    pinch = { ...g, s: view.s, anchor: { x: (g.cx - base.left - view.tx) / view.s, y: (g.cy - base.top - view.ty) / view.s } };
+  }
 });
+
+stage.addEventListener('pointermove', (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pointers.size >= 2) {
+    const g = pinchState();
+    zoomAt(g.cx, g.cy, (pinch.s * g.d) / pinch.d, pinch.anchor);
+  } else if (picking) {
+    pick(e, false);
+  }
+});
+
+function pointerEnd(e, commit) {
+  if (!pointers.delete(e.pointerId)) return;
+  if (picking && commit) {
+    picking = false;
+    pick(e, true);
+  } else if (picking) {
+    cancelPick();
+  }
+  // Lifting one finger of a pinch must not start a pick with the other one.
+  if (pointers.size === 0) pinch = null;
+}
+stage.addEventListener('pointerup', (e) => pointerEnd(e, true));
+stage.addEventListener('pointercancel', (e) => pointerEnd(e, false));
+
+stage.addEventListener('wheel', (e) => {
+  if (!pixels) return;
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, view.s * Math.exp(-e.deltaY * 0.002));
+}, { passive: false });
+
+$('#fitPhoto').addEventListener('click', resetView);
+window.addEventListener('resize', () => pixels && applyView());
 
 // ---------- solving ----------
 
@@ -506,7 +603,7 @@ $('#addPaint').addEventListener('click', () => {
 });
 
 $('#resetPaints').addEventListener('click', () => {
-  if (!confirm('Replace your paint list with the 12 default Apple Barrel paints?')) return;
+  if (!confirm('Replace your paint list with the 16 default DecoArt Americana paints?')) return;
   state.paints = clone(DEFAULT_PAINTS);
   renderPaints();
   paintsChanged();

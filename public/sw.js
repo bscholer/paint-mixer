@@ -1,6 +1,6 @@
 // Network first, cache as fallback: new deploys show up at once, and the app still opens offline.
 // The API is never cached here. The app keeps its own copy of paints and recipes in localStorage.
-const CACHE = 'paint-mixer-v1';
+const CACHE = 'paint-mixer-v2';
 const SHELL = [
   './',
   'index.html',
