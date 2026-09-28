@@ -42,6 +42,7 @@ const state = {
   recipes: store.get('recipes', []),
   results: [],
   scales: [],
+  calibrations: [],
 };
 
 // ---------- server ----------
@@ -232,7 +233,8 @@ function pick(e, commit) {
   const x = Math.min(canvas.width - 1, Math.max(0, Math.floor((e.clientX - rect.left) * scale)));
   const y = Math.min(canvas.height - 1, Math.max(0, Math.floor((e.clientY - rect.top) * scale)));
   // About a 9px screen square, so zooming in also makes the sample smaller.
-  const hex = sampleAt(x, y, Math.max(0, Math.round(4 * scale)));
+  const radius = Math.max(0, Math.round(4 * scale));
+  const hex = sampleAt(x, y, radius);
   lastPick = { x, y };
   placeMarker();
 
@@ -247,7 +249,7 @@ function pick(e, commit) {
   loupe.style.color = textOn(hex);
 
   if (calib) {
-    if (commit) recordCalibSample(hex);
+    if (commit) recordCalibSample({ hex, x, y, radius });
   } else if (commit) setTarget(hex);
   else previewTarget(hex);
 }
@@ -686,10 +688,10 @@ $('#calibDialog button[value=start]').addEventListener('click', (e) => {
     i: 0,
     samples: new Map(),
     steps: [
-      { key: 'white', label: `${white.name} patch` },
+      { key: 'white', paintId: white.id, kind: 'white', label: `${white.name} patch` },
       ...others.flatMap((p) => [
-        { key: `${p.id}:mass`, label: `${p.name}, pure` },
-        { key: `${p.id}:tint`, label: `${p.name} + ${whiteDrops} ${white.name}` },
+        { key: `${p.id}:mass`, paintId: p.id, kind: 'mass', label: `${p.name}, pure` },
+        { key: `${p.id}:tint`, paintId: p.id, kind: 'tint', label: `${p.name} + ${whiteDrops} ${white.name}` },
       ]),
     ],
   };
@@ -718,8 +720,8 @@ function advanceCalib() {
   else finishCalib();
 }
 
-function recordCalibSample(hex) {
-  calib.samples.set(calib.steps[calib.i].key, hex);
+function recordCalibSample(sample) {
+  calib.samples.set(calib.steps[calib.i].key, sample);
   advanceCalib();
 }
 
@@ -734,26 +736,35 @@ $('#calibBack').addEventListener('click', () => {
 });
 $('#calibCancel').addEventListener('click', endCalib);
 
-function finishCalib() {
-  const { white, whiteDrops, samples } = calib;
-  const others = state.paints.filter((p) => p.enabled && p !== white);
+// samples: [{ paintId, kind: 'white' | 'mass' | 'tint', hex }] as stored with a calibration.
+// Paints that no longer exist are left out.
+function calibrationChanges({ whiteId, whiteDrops, samples }) {
+  const white = state.paints.find((p) => p.id === whiteId);
+  const whiteSample = samples.find((s) => s.kind === 'white');
+  if (!white || !whiteSample) return null;
+  const byPaint = new Map();
+  for (const s of samples) {
+    if (s.kind === 'white') continue;
+    if (!byPaint.has(s.paintId)) byPaint.set(s.paintId, {});
+    byPaint.get(s.paintId)[s.kind] = s.hex;
+  }
+  const paints = [...byPaint.keys()].map((id) => state.paints.find((p) => p.id === id)).filter(Boolean);
   const results = calibrate({
-    white: samples.get('white'),
+    white: whiteSample.hex,
     whiteDrops,
-    samples: others.map((p) => ({
-      id: p.id,
-      mass: samples.get(`${p.id}:mass`),
-      tint: samples.get(`${p.id}:tint`),
-      fallbackHex: p.hex,
-    })),
+    samples: paints.map((p) => ({ id: p.id, ...byPaint.get(p.id), fallbackHex: p.hex })),
   });
   const changes = [{ paint: white, hex: WHITE_REFERENCE, strength: 1 }];
   for (const r of results) {
     if (r.hex || r.strength) changes.push({ paint: state.paints.find((p) => p.id === r.id), hex: r.hex, strength: r.strength });
   }
-  calib.i = calib.steps.length - 1;
-  calib.changes = changes;
+  return changes;
+}
 
+let review = null;
+
+function openReview(changes) {
+  review = changes;
   const swatch = (hex) => h('i', { class: 'dot', style: { background: hex } });
   $('#calibResults').replaceChildren(
     ...changes.map(({ paint, hex, strength }) =>
@@ -768,19 +779,58 @@ function finishCalib() {
   $('#calibReview').showModal();
 }
 
+// Keeps the photo and every tap on the server, so a new model can refit without new photos.
+async function saveCalibration(calibration) {
+  try {
+    const saved = await api('/api/calibrations', {
+      method: 'POST',
+      body: { ...calibration, photo: canvas.toDataURL('image/jpeg', 0.92) },
+    });
+    state.calibrations.unshift(saved);
+    renderRecompute();
+  } catch (err) {
+    toast(`Calibration photo not saved: ${err.message}`);
+  }
+}
+
+function finishCalib() {
+  const { white, whiteDrops } = calib;
+  const samples = calib.steps
+    .filter((step) => calib.samples.has(step.key))
+    .map(({ key, paintId, kind }) => ({ paintId, kind, ...calib.samples.get(key) }));
+  const calibration = { whiteId: white.id, whiteDrops, samples };
+  calib.i = calib.steps.length - 1;
+  saveCalibration(calibration);
+  openReview(calibrationChanges(calibration));
+}
+
+function renderRecompute() {
+  const latest = state.calibrations[0];
+  $('#recomputeCalib').hidden = !latest;
+  if (latest) $('#recomputeCalib').textContent = `Recompute from ${new Date(latest.createdAt).toLocaleDateString()} photo`;
+}
+
+$('#recomputeCalib').addEventListener('click', () => {
+  const changes = calibrationChanges(state.calibrations[0]);
+  if (!changes) return toast('The white paint of that calibration no longer exists.');
+  openReview(changes);
+});
+
 $('#calibReview').addEventListener('close', () => {
-  if (!calib) return;
+  const changes = review;
+  review = null;
+  if (!changes) return;
   if ($('#calibReview').returnValue === 'apply') {
-    for (const { paint, hex, strength } of calib.changes) {
+    for (const { paint, hex, strength } of changes) {
       if (hex) paint.hex = hex;
       if (strength) paint.strength = round2(Math.min(100, Math.max(0.01, strength)));
     }
     renderPaints();
     paintsChanged();
-    toast(`Calibrated ${calib.changes.length} paints.`);
-    endCalib();
+    toast(`Calibrated ${changes.length} paints.`);
+    if (calib) endCalib();
     showTab('paints');
-  } else {
+  } else if (calib) {
     renderCalib();
   }
 });
@@ -789,9 +839,15 @@ $('#calibReview').addEventListener('close', () => {
 
 async function sync() {
   try {
-    const [paints, recipes] = await Promise.all([api('/api/paints'), api('/api/recipes')]);
+    const [paints, recipes, calibrations] = await Promise.all([
+      api('/api/paints'),
+      api('/api/recipes'),
+      api('/api/calibrations'),
+    ]);
     state.paints = paints;
     state.recipes = recipes;
+    state.calibrations = calibrations;
+    renderRecompute();
     store.set('paints', paints);
     store.set('recipes', recipes);
     renderPaints();

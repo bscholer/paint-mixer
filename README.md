@@ -27,6 +27,10 @@ that has a lot of white in it. Chart colors do not tell you this, so calibrate y
 The app uses the white patch to remove the color cast of the light. Then it measures the color of
 each paint and fits its strength from the mixed patch.
 
+Each calibration is stored on the server: the photo, the position of every tap, and the sampled
+colors. When the mixing model changes, tap **Recompute from saved photo** on the Paints tab to fit
+the paints again from the stored taps. You do not need to paint or tap again.
+
 ## Run
 
 Needs Node 24 or later. There are no dependencies.
@@ -53,4 +57,7 @@ The app has no login of its own. Put it behind an auth proxy (for example, Cloud
 | GET    | `/api/recipes`      |                                                        |
 | POST   | `/api/recipes`      | `{name, targetHex, mixHex, deltaE, drops: [{name, hex, count}]}` |
 | DELETE | `/api/recipes/:id`  |                                                        |
+| GET    | `/api/calibrations` | (newest first, without photos)                         |
+| POST   | `/api/calibrations` | `{whiteId, whiteDrops, samples: [{paintId, kind, hex, x, y, radius}], photo}` |
+| GET    | `/api/calibrations/:id/photo` |                                              |
 | GET    | `/healthz`          |                                                        |

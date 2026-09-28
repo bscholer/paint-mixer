@@ -151,3 +151,32 @@ test('paint strength persists and out-of-range strength is rejected', async () =
     assert.equal((await req('/api/paints', 'PUT', [{ ...paints[0], strength }])).status, 400, String(strength));
   }
 });
+
+test('calibrations keep their samples and photo across a restart', async () => {
+  const photo = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9]);
+  const body = {
+    whiteId: 'snow-white',
+    whiteDrops: 5,
+    samples: [
+      { paintId: 'snow-white', kind: 'white', hex: '#f4e0b9', x: 10, y: 20, radius: 4 },
+      { paintId: 'lamp-black', kind: 'tint', hex: '#28241e', x: 300, y: 20, radius: 4 },
+    ],
+    photo: `data:image/jpeg;base64,${photo.toString('base64')}`,
+  };
+  const saved = await (await req('/api/calibrations', 'POST', body)).json();
+  await stop();
+  await start();
+
+  const [listed] = await (await req('/api/calibrations')).json();
+  assert.equal(listed.id, saved.id);
+  assert.deepEqual(listed.samples, body.samples);
+  assert.equal(listed.whiteDrops, 5);
+  assert.equal(listed.photo, undefined);
+
+  const res = await req(`/api/calibrations/${saved.id}/photo`);
+  assert.equal(res.headers.get('content-type'), 'image/jpeg');
+  assert.deepEqual(Buffer.from(await res.arrayBuffer()), photo);
+
+  assert.equal((await req('/api/calibrations', 'POST', { ...body, photo: 'data:text/html;base64,PGI+' })).status, 400);
+  assert.equal((await req('/api/calibrations', 'POST', { ...body, samples: [{ ...body.samples[0], kind: 'other' }] })).status, 400);
+});

@@ -7,6 +7,8 @@ import { DEFAULT_PAINTS } from './public/paints.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
 const MAX_BODY = 64 * 1024;
+// A calibration carries its photo as a data URL.
+const MAX_CALIBRATION_BODY = 12 * 1024 * 1024;
 const HEX_RE = /^#[0-9a-f]{6}$/;
 
 const CONTENT_TYPES = {
@@ -59,6 +61,23 @@ export function openDb(dataDir) {
     `);
     if (version < 1) writePaints(db, DEFAULT_PAINTS);
     db.exec('PRAGMA user_version = 2; COMMIT;');
+  }
+  if (version < 3) {
+    // Raw calibration input, kept so a new mixing model can refit paints without new photos.
+    db.exec(`
+      BEGIN;
+      CREATE TABLE calibrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        white_id TEXT NOT NULL,
+        white_drops INTEGER NOT NULL,
+        samples TEXT NOT NULL,
+        photo BLOB NOT NULL,
+        photo_type TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+      PRAGMA user_version = 3;
+      COMMIT;
+    `);
   }
   return db;
 }
@@ -128,12 +147,56 @@ function validateRecipe(b) {
   };
 }
 
-async function readJson(req) {
+const PHOTO_RE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]+=*)$/;
+const SAMPLE_KINDS = new Set(['white', 'mass', 'tint']);
+
+function validateCalibration(b) {
+  const photo = b && typeof b.photo === 'string' ? PHOTO_RE.exec(b.photo) : null;
+  const ok =
+    photo &&
+    str(b.whiteId, 64) &&
+    Number.isInteger(b.whiteDrops) &&
+    b.whiteDrops >= 1 &&
+    b.whiteDrops <= 50 &&
+    Array.isArray(b.samples) &&
+    b.samples.length > 0 &&
+    b.samples.length <= 300 &&
+    b.samples.every(
+      (s) =>
+        s &&
+        SAMPLE_KINDS.has(s.kind) &&
+        str(s.paintId, 64) &&
+        hex(s.hex) &&
+        Number.isInteger(s.x) &&
+        Number.isInteger(s.y) &&
+        Number.isInteger(s.radius),
+    );
+  if (!ok) throw new HttpError(400, 'calibration needs whiteId, whiteDrops, samples [{paintId, kind, hex, x, y, radius}], and a photo data URL');
+  return {
+    whiteId: b.whiteId,
+    whiteDrops: b.whiteDrops,
+    samples: b.samples.map(({ paintId, kind, hex, x, y, radius }) => ({ paintId, kind, hex, x, y, radius })),
+    photoType: photo[1],
+    photo: Buffer.from(photo[2], 'base64'),
+  };
+}
+
+function readCalibration(row) {
+  return {
+    id: row.id,
+    whiteId: row.white_id,
+    whiteDrops: row.white_drops,
+    samples: JSON.parse(row.samples),
+    createdAt: row.created_at,
+  };
+}
+
+async function readJson(req, maxBody = MAX_BODY) {
   let size = 0;
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) throw new HttpError(413, 'body too large');
+    if (size > maxBody) throw new HttpError(413, 'body too large');
     chunks.push(chunk);
   }
   try {
@@ -210,6 +273,32 @@ export function createServer({ dataDir }) {
         return send(res, 201, readRecipe(row));
       }
       throw new HttpError(405, 'method not allowed');
+    }
+
+    if (pathname === '/api/calibrations') {
+      if (method === 'GET') {
+        const rows = db.prepare('SELECT id, white_id, white_drops, samples, created_at FROM calibrations ORDER BY id DESC').all();
+        return send(res, 200, rows.map(readCalibration));
+      }
+      if (method === 'POST') {
+        const c = validateCalibration(await readJson(req, MAX_CALIBRATION_BODY));
+        const row = db
+          .prepare(
+            'INSERT INTO calibrations (white_id, white_drops, samples, photo, photo_type) VALUES (?, ?, ?, ?, ?) RETURNING id, white_id, white_drops, samples, created_at',
+          )
+          .get(c.whiteId, c.whiteDrops, JSON.stringify(c.samples), c.photo, c.photoType);
+        return send(res, 201, readCalibration(row));
+      }
+      throw new HttpError(405, 'method not allowed');
+    }
+
+    const photoMatch = /^\/api\/calibrations\/(\d+)\/photo$/.exec(pathname);
+    if (photoMatch) {
+      if (method !== 'GET') throw new HttpError(405, 'method not allowed');
+      const row = db.prepare('SELECT photo, photo_type FROM calibrations WHERE id = ?').get(Number(photoMatch[1]));
+      if (!row) throw new HttpError(404, 'calibration not found');
+      res.writeHead(200, { 'Content-Type': row.photo_type, 'Cache-Control': 'private, max-age=31536000, immutable' });
+      return res.end(Buffer.from(row.photo));
     }
 
     const recipeMatch = /^\/api\/recipes\/(\d+)$/.exec(pathname);
