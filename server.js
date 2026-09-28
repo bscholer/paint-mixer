@@ -1,0 +1,239 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+import { DEFAULT_PAINTS } from './public/paints.js';
+
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+const MAX_BODY = 64 * 1024;
+const HEX_RE = /^#[0-9a-f]{6}$/;
+
+const CONTENT_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.webmanifest': 'application/manifest+json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+};
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export function openDb(dataDir) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const db = new DatabaseSync(path.join(dataDir, 'paint-mixer.db'));
+  db.exec('PRAGMA journal_mode = WAL');
+  const { user_version: version } = db.prepare('PRAGMA user_version').get();
+  if (version < 1) {
+    db.exec(`
+      BEGIN;
+      CREATE TABLE paints (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        hex TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        position INTEGER NOT NULL
+      );
+      CREATE TABLE recipes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        target_hex TEXT NOT NULL,
+        mix_hex TEXT NOT NULL,
+        delta_e REAL NOT NULL,
+        drops TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+      );
+    `);
+    writePaints(db, DEFAULT_PAINTS);
+    db.exec('PRAGMA user_version = 1; COMMIT;');
+  }
+  return db;
+}
+
+function writePaints(db, paints) {
+  db.exec('DELETE FROM paints');
+  const insert = db.prepare('INSERT INTO paints (id, name, hex, enabled, position) VALUES (?, ?, ?, ?, ?)');
+  paints.forEach((p, i) => insert.run(p.id, p.name, p.hex, p.enabled ? 1 : 0, i));
+}
+
+function readPaints(db) {
+  return db
+    .prepare('SELECT id, name, hex, enabled FROM paints ORDER BY position')
+    .all()
+    .map((p) => ({ ...p, enabled: !!p.enabled }));
+}
+
+function readRecipe(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    targetHex: row.target_hex,
+    mixHex: row.mix_hex,
+    deltaE: row.delta_e,
+    drops: JSON.parse(row.drops),
+    createdAt: row.created_at,
+  };
+}
+
+const str = (v, max) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
+const hex = (v) => typeof v === 'string' && HEX_RE.test(v);
+
+function validatePaints(body) {
+  if (!Array.isArray(body) || body.length > 100) throw new HttpError(400, 'expected an array of at most 100 paints');
+  const ids = new Set();
+  for (const p of body) {
+    if (!p || !str(p.id, 64) || !str(p.name, 60) || !hex(p.hex) || typeof p.enabled !== 'boolean') {
+      throw new HttpError(400, 'each paint needs id, name, lowercase #rrggbb hex, and enabled');
+    }
+    if (ids.has(p.id)) throw new HttpError(400, `duplicate paint id ${p.id}`);
+    ids.add(p.id);
+  }
+  return body.map(({ id, name, hex, enabled }) => ({ id, name: name.trim(), hex, enabled }));
+}
+
+function validateRecipe(b) {
+  const ok =
+    b &&
+    str(b.name, 80) &&
+    hex(b.targetHex) &&
+    hex(b.mixHex) &&
+    Number.isFinite(b.deltaE) &&
+    Array.isArray(b.drops) &&
+    b.drops.length > 0 &&
+    b.drops.length <= 12 &&
+    b.drops.every((d) => d && str(d.name, 60) && hex(d.hex) && Number.isInteger(d.count) && d.count > 0 && d.count <= 999);
+  if (!ok) throw new HttpError(400, 'recipe needs name, targetHex, mixHex, deltaE, and drops [{name, hex, count}]');
+  return {
+    name: b.name.trim(),
+    targetHex: b.targetHex,
+    mixHex: b.mixHex,
+    deltaE: b.deltaE,
+    drops: b.drops.map(({ name, hex, count }) => ({ name, hex, count })),
+  };
+}
+
+async function readJson(req) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY) throw new HttpError(413, 'body too large');
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError(400, 'invalid JSON');
+  }
+}
+
+function send(res, status, body, type = 'application/json') {
+  const payload = type === 'application/json' && body !== undefined ? JSON.stringify(body) : body;
+  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' });
+  res.end(payload);
+}
+
+function serveStatic(req, res, pathname) {
+  let rel;
+  try {
+    rel = pathname === '/' ? 'index.html' : decodeURIComponent(pathname).replace(/^\/+/, '');
+  } catch {
+    throw new HttpError(404, 'not found');
+  }
+  const file = path.resolve(PUBLIC_DIR, rel);
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) throw new HttpError(404, 'not found');
+  let data;
+  try {
+    data = fs.readFileSync(file);
+  } catch {
+    throw new HttpError(404, 'not found');
+  }
+  res.writeHead(200, {
+    'Content-Type': CONTENT_TYPES[path.extname(file)] || 'application/octet-stream',
+    // The service worker owns offline caching. Always revalidate so deploys show up at once.
+    'Cache-Control': 'no-cache',
+  });
+  res.end(req.method === 'HEAD' ? undefined : data);
+}
+
+export function createServer({ dataDir }) {
+  const db = openDb(dataDir);
+
+  async function route(req, res) {
+    const { pathname } = new URL(req.url, 'http://localhost');
+    const method = req.method;
+
+    if (pathname === '/healthz') return send(res, 200, 'ok', 'text/plain');
+
+    if (pathname === '/api/paints') {
+      if (method === 'GET') return send(res, 200, readPaints(db));
+      if (method === 'PUT') {
+        const paints = validatePaints(await readJson(req));
+        db.exec('BEGIN');
+        try {
+          writePaints(db, paints);
+          db.exec('COMMIT');
+        } catch (e) {
+          db.exec('ROLLBACK');
+          throw e;
+        }
+        return send(res, 200, readPaints(db));
+      }
+      throw new HttpError(405, 'method not allowed');
+    }
+
+    if (pathname === '/api/recipes') {
+      if (method === 'GET') {
+        return send(res, 200, db.prepare('SELECT * FROM recipes ORDER BY id DESC').all().map(readRecipe));
+      }
+      if (method === 'POST') {
+        const r = validateRecipe(await readJson(req));
+        const row = db
+          .prepare('INSERT INTO recipes (name, target_hex, mix_hex, delta_e, drops) VALUES (?, ?, ?, ?, ?) RETURNING *')
+          .get(r.name, r.targetHex, r.mixHex, r.deltaE, JSON.stringify(r.drops));
+        return send(res, 201, readRecipe(row));
+      }
+      throw new HttpError(405, 'method not allowed');
+    }
+
+    const recipeMatch = /^\/api\/recipes\/(\d+)$/.exec(pathname);
+    if (recipeMatch) {
+      if (method !== 'DELETE') throw new HttpError(405, 'method not allowed');
+      const { changes } = db.prepare('DELETE FROM recipes WHERE id = ?').run(Number(recipeMatch[1]));
+      if (!changes) throw new HttpError(404, 'recipe not found');
+      return send(res, 204);
+    }
+
+    if (pathname.startsWith('/api/')) throw new HttpError(404, 'not found');
+    if (method !== 'GET' && method !== 'HEAD') throw new HttpError(405, 'method not allowed');
+    return serveStatic(req, res, pathname);
+  }
+
+  const server = http.createServer((req, res) => {
+    route(req, res).catch((err) => {
+      const status = err instanceof HttpError ? err.status : 500;
+      if (status === 500) console.error(err);
+      if (!res.headersSent) send(res, status, { error: status === 500 ? 'internal error' : err.message });
+    });
+  });
+  server.on('close', () => db.close());
+  return server;
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const port = Number(process.env.PORT || 8080);
+  const server = createServer({ dataDir: process.env.DATA_DIR || './data' });
+  server.listen(port, () => console.log(`paint-mixer listening on :${port}`));
+  const stop = () => {
+    server.close(() => process.exit(0));
+    server.closeIdleConnections();
+  };
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+}

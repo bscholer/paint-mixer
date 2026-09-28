@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Paint Mixer</title>
+  <meta name="description" content="Match a color with drops of the paints you own.">
+  <meta name="theme-color" content="#f6f3ee" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#16140f" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Paint Mixer">
+  <!-- use-credentials: the site sits behind Cloudflare Access, which needs its cookie on the manifest fetch. -->
+  <link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>Paint Mixer</h1>
+  </header>
+
+  <main>
+    <section id="tab-mix" class="panel" data-panel="mix">
+      <div class="card target">
+        <div class="target-swatch" id="targetSwatch"><span id="targetLabel">Pick a color</span></div>
+        <div class="target-controls">
+          <label class="field hex-field">
+            <span>Hex</span>
+            <input id="hexInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="#6b8e23" maxlength="7">
+          </label>
+          <label class="icon-btn color-btn" title="Color picker">
+            <input id="colorInput" type="color" value="#6b8e23" aria-label="Color picker">
+          </label>
+          <label class="btn primary photo-btn">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+            Photo
+            <input id="photoInput" type="file" accept="image/*" hidden>
+          </label>
+        </div>
+      </div>
+
+      <div class="card photo" id="photoCard" hidden>
+        <div class="photo-stage">
+          <canvas id="photoCanvas"></canvas>
+          <div class="marker" id="marker" hidden></div>
+          <div class="loupe" id="loupe" hidden></div>
+        </div>
+        <div class="photo-foot">
+          <span class="muted">Tap or drag on the photo to pick a color.</span>
+          <button class="btn ghost" id="clearPhoto" type="button">Close</button>
+        </div>
+      </div>
+
+      <div class="range-row">
+        <label for="maxDrops">Max drops</label>
+        <input id="maxDrops" type="range" min="5" max="60" step="1" value="30">
+        <output id="maxDropsOut">30</output>
+      </div>
+
+      <div id="status" class="status muted" aria-live="polite"></div>
+      <div id="results" class="results"></div>
+      <p class="footnote muted">The mix color is a prediction. Real paint varies by brand, batch, and how it dries. Calibrate your paints for the best results.</p>
+    </section>
+
+    <section id="tab-saved" class="panel" data-panel="saved" hidden>
+      <div id="savedList" class="saved-list"></div>
+    </section>
+
+    <section id="tab-paints" class="panel" data-panel="paints" hidden>
+      <p class="muted intro">Only checked paints go into a mix. To calibrate a paint, pick its dried swatch on the Mix tab. Then tap <svg class="inline-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19l9-9m-2-2 4 4m-1-5 2-2a2.1 2.1 0 0 1 3 3l-2 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> on that paint.</p>
+      <ul id="paintList" class="paint-list"></ul>
+      <div class="row-buttons">
+        <button class="btn primary" id="addPaint" type="button">Add paint</button>
+        <button class="btn ghost" id="resetPaints" type="button">Reset to defaults</button>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="mix" aria-selected="true">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3c3 4 6 7.2 6 10.5A6 6 0 0 1 6 13.5C6 10.2 9 7 12 3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      Mix
+    </button>
+    <button role="tab" data-tab="saved" aria-selected="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16l-6-4-6 4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      Saved
+    </button>
+    <button role="tab" data-tab="paints" aria-selected="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="9" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="16" cy="9" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="16" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      Paints
+    </button>
+  </nav>
+
+  <dialog id="saveDialog">
+    <form method="dialog">
+      <h2>Save recipe</h2>
+      <div class="dialog-swatch" id="saveSwatch"></div>
+      <label class="field">
+        <span>Name</span>
+        <input id="saveName" name="name" type="text" maxlength="80" required autocomplete="off">
+      </label>
+      <div class="row-buttons end">
+        <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn primary" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

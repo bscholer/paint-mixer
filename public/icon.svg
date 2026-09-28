@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#f6f3ee"/>
+  <g>
+    <path d="M200 96c40 54 84 98 84 148a84 84 0 0 1-168 0c0-50 44-94 84-148z" style="mix-blend-mode:multiply" fill="#e0457b"/>
+    <path d="M312 96c40 54 84 98 84 148a84 84 0 0 1-168 0c0-50 44-94 84-148z" style="mix-blend-mode:multiply" fill="#ffd100"/>
+    <path d="M256 196c40 54 84 98 84 148a84 84 0 0 1-168 0c0-50 44-94 84-148z" style="mix-blend-mode:multiply" fill="#1e88e5"/>
+  </g>
+</svg>
